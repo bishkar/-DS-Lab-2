@@ -1,0 +1,91 @@
+name: GitHub Classroom Workflow
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+    branches:
+      - main
+      - master
+
+permissions:
+  checks: write
+  actions: read
+  contents: read
+
+jobs:
+  test:
+    name: Run Tests
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Create virtual environment
+        run: |
+          python -m venv venv
+
+      - name: Activate venv and install dependencies
+        run: |
+          source venv/bin/activate
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run Task 1 Tests
+        run: |
+          source venv/bin/activate
+          pytest tests/test_task1_data_cleaning.py -v --tb=short
+        continue-on-error: false
+
+      - name: Run Task 2 Tests
+        run: |
+          source venv/bin/activate
+          pytest tests/test_task2_outlier_detection.py -v --tb=short
+        continue-on-error: false
+
+      - name: Run Task 3 Tests
+        run: |
+          source venv/bin/activate
+          pytest tests/test_task3_scaling.py -v --tb=short
+        continue-on-error: false
+
+      - name: Run Task 4 Tests
+        run: |
+          source venv/bin/activate
+          pytest tests/test_task4_feature_engineering.py -v --tb=short
+        continue-on-error: false
+
+      - name: Run Task 5 Tests
+        run: |
+          source venv/bin/activate
+          pytest tests/test_task5_pipeline.py -v --tb=short
+        continue-on-error: false
+
+      - name: Run Task 6 Tests
+        run: |
+          source venv/bin/activate
+          pytest tests/test_task6_case_study.py -v --tb=short
+        continue-on-error: false
+
+      - name: Generate Test Report
+        if: always()
+        run: |
+          source venv/bin/activate
+          pytest tests/ --tb=short --junitxml=test-results.xml
+
+      - name: Publish Test Results
+        uses: EnricoMi/publish-unit-test-result-action@v2
+        if: always()
+        with:
+          files: test-results.xml
+          check_name: Test Results
+          comment_title: Test Results Summary
