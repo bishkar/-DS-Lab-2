@@ -21,16 +21,45 @@ from sklearn.preprocessing import (
     MaxAbsScaler, PowerTransformer
 )
 from sklearn.linear_model import LinearRegression, SGDRegressor
-from sklearn.neighbors import KNeighborsClassifier
-from sklearn.svm import SVC
-from sklearn.neural_network import MLPClassifier
+from sklearn.neighbors import KNeighborsClassifier, KNeighborsRegressor
+from sklearn.svm import SVC, SVR
+from sklearn.neural_network import MLPClassifier, MLPRegressor
 from sklearn.model_selection import cross_val_score, learning_curve
 from sklearn.datasets import make_classification
-from typing import Tuple, Dict, List
+from typing import Any, Callable, Tuple, Dict, List, Literal
+from functools import partial
 import warnings
 from mpl_toolkits.mplot3d import Axes3D
 
+from sklearn.base import is_classifier
+
+from common import Schema, lookup_dataset, median_filled, numeric_columns, stats_by_frame, validated
+
 warnings.filterwarnings('ignore')
+
+
+ModelType = Literal['linear_regression', 'knn', 'svm', 'neural_network']
+PowerMethod = Literal['yeo-johnson', 'box-cox']
+
+MODEL_FACTORIES: Dict[str, Tuple[Callable[[], Any], Callable[[], Any]]] = {
+    'linear_regression': (LinearRegression, LinearRegression),
+    'knn': (partial(KNeighborsClassifier, n_neighbors=5), partial(KNeighborsRegressor, n_neighbors=5)),
+    'svm': (partial(SVC, kernel='rbf', random_state=42), SVR),
+    'neural_network': (
+        partial(MLPClassifier, hidden_layer_sizes=(50,), max_iter=500, random_state=42),
+        partial(MLPRegressor, hidden_layer_sizes=(50,), max_iter=500, random_state=42),
+    ),
+}
+
+
+class ModelScore(Schema):
+    cv_score: float
+    cv_std: float
+    scoring: Literal['accuracy', 'r2']
+
+
+def is_discrete_target(y: pd.Series) -> bool:
+    return y.nunique() <= 10 and bool(np.allclose(y.dropna() % 1, 0))
 
 
 class ScalingAnalyzer:
@@ -63,6 +92,7 @@ class ScalingAnalyzer:
         self.scaled_datasets = {}
         self.scalers = {}
         
+    @validated
     def apply_minmax_scaling(self, feature_range: Tuple[float, float] = (0, 1)) -> pd.DataFrame:
         """
         Apply Min-Max scaling to rescale features to a fixed range.
@@ -73,8 +103,21 @@ class ScalingAnalyzer:
         Returns:
             pd.DataFrame: DataFrame with features scaled to specified range.
         """
-        pass
-    
+
+        return self._apply_scaler('minmax', MinMaxScaler(feature_range=feature_range))
+
+    def _feature_columns(self) -> List[str]:
+        return numeric_columns(self.data, exclude=[self.target_col])
+
+    def _apply_scaler(self, name: str, scaler) -> pd.DataFrame:
+        scaled = self.data.copy()
+        features = self._feature_columns()
+        if features and len(scaled) > 0:
+            scaled[features] = scaler.fit_transform(scaled[features].astype(float))
+        self.scalers[name] = scaler
+        self.scaled_datasets[name] = scaled
+        return scaled
+
     def apply_standard_scaling(self) -> pd.DataFrame:
         """
         Apply Z-score normalization (standardization) to have mean=0 and std=1.
@@ -82,8 +125,8 @@ class ScalingAnalyzer:
         Returns:
             pd.DataFrame: DataFrame with standardized features.
         """
-        pass
-    
+        return self._apply_scaler('standard', StandardScaler())
+
     def apply_robust_scaling(self) -> pd.DataFrame:
         """
         Apply Robust scaling using median and IQR (effective for outliers).
@@ -91,8 +134,8 @@ class ScalingAnalyzer:
         Returns:
             pd.DataFrame: DataFrame with robust scaled features.
         """
-        pass
-    
+        return self._apply_scaler('robust', RobustScaler())
+
     def apply_maxabs_scaling(self) -> pd.DataFrame:
         """
         Apply MaxAbs scaling to scale by maximum absolute value.
@@ -100,9 +143,10 @@ class ScalingAnalyzer:
         Returns:
             pd.DataFrame: DataFrame with maxabs scaled features.
         """
-        pass
-    
-    def apply_power_transform(self, method: str = 'yeo-johnson') -> pd.DataFrame:
+        return self._apply_scaler('maxabs', MaxAbsScaler())
+
+    @validated
+    def apply_power_transform(self, method: PowerMethod = 'yeo-johnson')-> pd.DataFrame:
         """
         Apply power transformation to make data more Gaussian-like.
         
@@ -112,8 +156,11 @@ class ScalingAnalyzer:
         Returns:
             pd.DataFrame: DataFrame with power transformed and standardized features.
         """
-        pass
-    
+
+        if method == 'box-cox' and (self.data[self._feature_columns()] <= 0).any().any():
+            method = 'yeo-johnson'
+        return self._apply_scaler('power', PowerTransformer(method=method, standardize=True))
+
     def get_scaling_summary(self) -> pd.DataFrame:
         """
         Get summary statistics for each scaling method.
@@ -121,9 +168,12 @@ class ScalingAnalyzer:
         Returns:
             DataFrame with statistics for each scaling method
         """
-        pass
-    
-    def evaluate_model_performance(self, model_type: str = 'linear_regression',
+
+        return stats_by_frame({'original': self.original_data, **self.scaled_datasets},
+                              self._feature_columns())
+
+    @validated
+    def evaluate_model_performance(self, model_type: ModelType = 'linear_regression',
                                    dataset_name: str = 'original') -> Dict[str, float]:
         """
         Evaluate model performance with different scaling methods.
@@ -135,8 +185,26 @@ class ScalingAnalyzer:
         Returns:
             Dict[str, float]: Dictionary containing cv_score and cv_std.
         """
-        pass
-    
+
+        df = lookup_dataset(dataset_name, self.data, self.scaled_datasets)
+        if not self.target_col or self.target_col not in df.columns:
+            raise ValueError("A valid target column is required for model evaluation")
+        features = self._feature_columns()
+        if not features:
+            raise ValueError("No numeric features available for evaluation")
+
+        X = median_filled(df[features].astype(float))
+        y = df[self.target_col]
+        classifier, regressor = MODEL_FACTORIES[model_type]
+        model = (classifier if is_discrete_target(y) else regressor)()
+        scoring = 'accuracy' if is_classifier(model) else 'r2'
+
+        cv = min(5, len(X))
+        if scoring == 'accuracy':
+            cv = max(2, min(cv, int(y.value_counts().min())))
+        scores = cross_val_score(model, X, y, cv=cv, scoring=scoring)
+        return ModelScore(cv_score=scores.mean(), cv_std=scores.std(), scoring=scoring).model_dump()
+
     def compare_model_performance(self, model_types: List[str] = None) -> pd.DataFrame:
         """
         Compare performance across different scaling methods and models.
@@ -255,7 +323,9 @@ class ScalingAnalyzer:
                 data_to_plot.append(scaled_df[feature].dropna())
                 labels.append(method_name.upper())
             
-            bp = ax.boxplot(data_to_plot, labels=labels, patch_artist=True)
+            bp = ax.boxplot(data_to_plot, patch_artist=True)
+            ax.set_xticks(range(1, len(labels) + 1))
+            ax.set_xticklabels(labels)
             
             # Color the boxes
             colors = ['skyblue'] + ['lightcoral'] * len(self.scaled_datasets)

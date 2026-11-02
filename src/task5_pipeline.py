@@ -33,11 +33,25 @@ from sklearn.metrics import (
 )
 from sklearn.datasets import make_classification
 from scipy import stats
-from typing import Tuple, Dict, List, Optional, Any
+from typing import Tuple, Dict, List, Optional, Any, Literal
+from functools import partial
 import warnings
 import joblib
 
+from pydantic import PositiveInt
+
+from common import DEFAULT_K, SCALERS, OutlierMethod, validated
+
 warnings.filterwarnings('ignore')
+
+
+ImputerStrategy = Literal['mean', 'median', 'most_frequent', 'knn']
+ScalerType = Literal['standard', 'robust', 'minmax']
+
+IMPUTERS = {
+    **{strategy: partial(SimpleImputer, strategy=strategy) for strategy in ('mean', 'median', 'most_frequent')},
+    'knn': partial(KNNImputer, n_neighbors=5),
+}
 
 
 class OutlierHandler(BaseEstimator, TransformerMixin):
@@ -207,12 +221,13 @@ class PreprocessingPipeline:
         self.cv_results = {}
         self.feature_names = []
         
-    def create_pipeline(self, imputer_strategy: str = 'mean',
-                       outlier_method: str = 'iqr',
-                       scaler_type: str = 'standard',
+    @validated
+    def create_pipeline(self, imputer_strategy: ImputerStrategy = 'mean',
+                       outlier_method: OutlierMethod = 'iqr',
+                       scaler_type: ScalerType = 'standard',
                        feature_engineering: bool = True,
                        feature_selection: bool = True,
-                       n_features: int = 20) -> Pipeline:
+                       n_features: Optional[PositiveInt] = 20) -> Pipeline:
         """
         Create a sklearn pipeline with specified preprocessing steps.
         
@@ -227,29 +242,20 @@ class PreprocessingPipeline:
         Returns:
             Pipeline: Configured sklearn pipeline
         """
-        steps = []
-        
-        # Step 1: Imputation
-        pass
-        
-        # Step 2: Outlier handling
-        pass
-        
-        # Step 3: Feature engineering
-        pass
-        
-        # Step 4: Scaling
-        pass
-        
-        # Step 5: Feature selection
-        pass
-        
-        # Step 6: Classifier
-        pass
-        
-        self.pipeline = Pipeline(steps)
+
+        steps = [
+            ('imputer', IMPUTERS[imputer_strategy]()),
+            ('outlier_handler', OutlierHandler(method=outlier_method, strategy='cap',
+                                               threshold=DEFAULT_K[outlier_method])),
+            ('feature_engineer', FeatureEngineer()) if feature_engineering else None,
+            ('scaler', SCALERS[scaler_type]()),
+            ('feature_selector', SelectKBest(score_func=f_classif, k=n_features))
+            if feature_selection and n_features else None,
+            ('classifier', LogisticRegression(max_iter=1000, random_state=self.random_state)),
+        ]
+        self.pipeline = Pipeline([step for step in steps if step is not None])
         return self.pipeline
-    
+
     def prepare_data(self, X: pd.DataFrame, y: pd.Series, 
                     test_size: float = 0.2) -> Tuple[np.ndarray, np.ndarray, 
                                                       np.ndarray, np.ndarray]:
@@ -580,10 +586,12 @@ class PreprocessingPipeline:
         """
         fig, ax = plt.subplots(figsize=figsize)
         
-        bp = ax.boxplot([cv_scores], labels=['CV Scores'], patch_artist=True,
+        bp = ax.boxplot([cv_scores], patch_artist=True,
                        boxprops=dict(facecolor='lightblue'),
                        medianprops=dict(color='red', linewidth=2),
                        widths=0.5)
+        ax.set_xticks([1])
+        ax.set_xticklabels(['CV Scores'])
         
         # Add individual points
         ax.scatter([1] * len(cv_scores), cv_scores, color='darkblue', 

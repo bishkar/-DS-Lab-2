@@ -20,9 +20,49 @@ from sklearn.feature_selection import (
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import train_test_split, cross_val_score
 from sklearn.linear_model import LogisticRegression
-from typing import List, Dict, Tuple, Optional, Union
+from typing import Any, Callable, List, Dict, Tuple, Optional, Union, Literal
 import warnings
+from pydantic import PositiveInt
+
+from common import Schema, present, safe_divide, shift_non_negative, validated
+
 warnings.filterwarnings('ignore')
+
+
+MathOp = Literal['log', 'sqrt', 'square', 'cube', 'reciprocal']
+InteractionOp = Literal['multiply', 'add', 'subtract', 'divide', 'ratio']
+AggFunc = Literal['mean', 'std', 'min', 'max', 'count']
+
+
+class Transform(Schema):
+    apply: Callable[..., pd.Series]
+    description: str
+    suffix: str = ''
+
+
+class Encoding(Schema):
+    values: Any
+    state: Any
+    description: str
+
+
+MATH_TRANSFORMS: Dict[str, Transform] = {
+    'log': Transform(apply=lambda s: np.log1p(shift_non_negative(s)), description='log(1 + {a})'),
+    'sqrt': Transform(apply=lambda s: np.sqrt(shift_non_negative(s)), description='sqrt({a})'),
+    'square': Transform(apply=lambda s: s ** 2, description='{a}^2'),
+    'cube': Transform(apply=lambda s: s ** 3, description='{a}^3'),
+    'reciprocal': Transform(apply=lambda s: safe_divide(pd.Series(1.0, index=s.index), s),
+                            description='1 / {a}'),
+}
+
+INTERACTIONS: Dict[str, Transform] = {
+    'multiply': Transform(apply=lambda a, b: a * b, description='{a} * {b}', suffix='x'),
+    'add': Transform(apply=lambda a, b: a + b, description='{a} + {b}', suffix='plus'),
+    'subtract': Transform(apply=lambda a, b: a - b, description='{a} - {b}', suffix='minus'),
+    'divide': Transform(apply=safe_divide, description='{a} / {b}', suffix='div'),
+    'ratio': Transform(apply=lambda a, b: safe_divide(a, a.abs() + b.abs()),
+                       description='{a} / (|{a}| + |{b}|)', suffix='ratio'),
+}
 
 
 class FeatureEngineeringPipeline:
@@ -47,11 +87,12 @@ class FeatureEngineeringPipeline:
         self.engineered_features = []
         self.feature_importance_scores = {}
         
+    @validated
     def create_mathematical_features(
         self,
         df: pd.DataFrame,
         columns: List[str],
-        operations: List[str] = ['log', 'sqrt', 'square', 'cube']
+        operations: List[MathOp] = ['log', 'sqrt', 'square', 'cube']
     ) -> pd.DataFrame:
         """
         Create new features using mathematical transformations.
@@ -70,13 +111,31 @@ class FeatureEngineeringPipeline:
         pd.DataFrame
             Dataframe with added mathematical features
         """
-        pass
-    
+
+        result = df.copy()
+        for col in present(result, columns, numeric=True):
+            values = result[col].astype(float)
+            for op in operations:
+                transform = MATH_TRANSFORMS[op]
+                self._register_feature(result, f'{col}_{op}', transform.apply(values),
+                                       transform.description.format(a=col))
+        return result
+
+    def _register_feature(self, df: pd.DataFrame, name: str, values, description: str):
+        df[name] = values
+        self._track(name, description)
+
+    def _track(self, name: str, description: str):
+        self.feature_catalog[name] = description
+        if name not in self.engineered_features:
+            self.engineered_features.append(name)
+
+    @validated
     def create_interaction_features(
         self,
         df: pd.DataFrame,
         column_pairs: List[Tuple[str, str]],
-        operations: List[str] = ['multiply', 'add', 'subtract', 'divide']
+        operations: List[InteractionOp] = ['multiply', 'add', 'subtract', 'divide']
     ) -> pd.DataFrame:
         """
         Create interaction features between pairs of columns.
@@ -95,14 +154,25 @@ class FeatureEngineeringPipeline:
         pd.DataFrame
             Dataframe with interaction features
         """
-        pass
-    
+
+        result = df.copy()
+        for a, b in column_pairs:
+            if len(present(result, (a, b))) < 2:
+                continue
+            left, right = result[a].astype(float), result[b].astype(float)
+            for op in operations:
+                transform = INTERACTIONS[op]
+                self._register_feature(result, f'{a}_{transform.suffix}_{b}', transform.apply(left, right),
+                                       transform.description.format(a=a, b=b))
+        return result
+
+    @validated
     def create_aggregation_features(
         self,
         df: pd.DataFrame,
         group_by: str,
         agg_columns: List[str],
-        agg_functions: List[str] = ['mean', 'std', 'min', 'max', 'count']
+        agg_functions: List[AggFunc] = ['mean', 'std', 'min', 'max', 'count']
     ) -> pd.DataFrame:
         """
         Create aggregation features based on groupby operations.
@@ -123,14 +193,26 @@ class FeatureEngineeringPipeline:
         pd.DataFrame
             Dataframe with aggregation features
         """
-        pass
-    
+
+        result = df.copy()
+        if group_by not in result.columns:
+            return result
+        grouped = result.groupby(group_by)
+        for col in present(result, [c for c in agg_columns if c != group_by]):
+            for func in agg_functions:
+                values = grouped[col].transform(func)
+                self._register_feature(result, f'{col}_{func}_by_{group_by}',
+                                       values.fillna(0) if func == 'std' else values,
+                                       f'{func} of {col} grouped by {group_by}')
+        return result
+
+    @validated
     def encode_onehot(
         self,
         df: pd.DataFrame,
         columns: List[str],
         drop_first: bool = False,
-        max_categories: int = 10
+        max_categories: PositiveInt = 10
     ) -> pd.DataFrame:
         """
         Apply one-hot encoding to categorical columns.
@@ -151,8 +233,31 @@ class FeatureEngineeringPipeline:
         pd.DataFrame
             Dataframe with one-hot encoded features
         """
-        pass
-    
+
+        result = df.copy()
+        for col in present(result, columns):
+            categories = result[col].astype(str)
+            if categories.nunique() > max_categories:
+                top = categories.value_counts().index[:max_categories]
+                categories = categories.where(categories.isin(top), 'Other')
+            dummies = pd.get_dummies(categories, prefix=col, dtype=int,
+                                     drop_first=drop_first and categories.nunique() > 1)
+            self.encoders[f'{col}_onehot'] = list(dummies.columns)
+            result = pd.concat([result.drop(columns=[col]), dummies], axis=1)
+            for name in dummies.columns:
+                self._track(name, f'One-hot indicator for {col} == {name[len(col) + 1:]}')
+        return result
+
+    def _add_encoding(self, df: pd.DataFrame, columns: List[str], suffix: str,
+                      encode: Callable[[pd.Series], Encoding]) -> pd.DataFrame:
+        result = df.copy()
+        for col in present(result, columns):
+            encoding = encode(result[col])
+            self.encoders[f'{col}_{suffix}'] = encoding.state
+            self._register_feature(result, f'{col}_{suffix}', encoding.values, encoding.description)
+        return result
+
+    @validated
     def encode_label(
         self,
         df: pd.DataFrame,
@@ -173,8 +278,18 @@ class FeatureEngineeringPipeline:
         pd.DataFrame
             Dataframe with label encoded features
         """
-        pass
-    
+
+        def encode(series: pd.Series) -> Encoding:
+            encoder = LabelEncoder()
+            return Encoding(
+                values=encoder.fit_transform(series.astype(str)).astype(np.int64),
+                state=encoder,
+                description=f'Label encoding of {series.name} ({len(encoder.classes_)} classes)',
+            )
+
+        return self._add_encoding(df, columns, 'label', encode)
+
+    @validated
     def encode_target(
         self,
         df: pd.DataFrame,
@@ -201,8 +316,24 @@ class FeatureEngineeringPipeline:
         pd.DataFrame
             Dataframe with target encoded features
         """
-        pass
-    
+
+        if target not in df.columns:
+            return df.copy()
+        global_mean = float(df[target].mean())
+
+        def encode(series: pd.Series) -> Encoding:
+            stats = df.groupby(series.name)[target].agg(['mean', 'count'])
+            mapping = ((stats['count'] * stats['mean'] + smoothing * global_mean)
+                       / (stats['count'] + smoothing)).to_dict()
+            return Encoding(
+                values=series.map(mapping).fillna(global_mean).astype(np.float64),
+                state={'mapping': mapping, 'global_mean': global_mean},
+                description=f'Target mean of {target} per {series.name} (smoothing={smoothing})',
+            )
+
+        return self._add_encoding(df, [c for c in columns if c != target], 'target', encode)
+
+    @validated
     def encode_frequency(
         self,
         df: pd.DataFrame,
@@ -223,13 +354,23 @@ class FeatureEngineeringPipeline:
         pd.DataFrame
             Dataframe with frequency encoded features
         """
-        pass
-    
+
+        def encode(series: pd.Series) -> Encoding:
+            mapping = series.value_counts(normalize=True).to_dict()
+            return Encoding(
+                values=series.map(mapping).fillna(0).astype(np.float64),
+                state=mapping,
+                description=f'Relative frequency of each {series.name} category',
+            )
+
+        return self._add_encoding(df, columns, 'freq', encode)
+
+    @validated
     def create_polynomial_features(
         self,
         df: pd.DataFrame,
         columns: List[str],
-        degree: int = 2,
+        degree: PositiveInt = 2,
         include_bias: bool = False
     ) -> pd.DataFrame:
         """
@@ -251,8 +392,20 @@ class FeatureEngineeringPipeline:
         pd.DataFrame
             Dataframe with polynomial features
         """
-        pass
-    
+
+        result = df.copy()
+        columns = present(result, columns)
+        if not columns:
+            return result
+        poly = PolynomialFeatures(degree=degree, include_bias=include_bias)
+        values = poly.fit_transform(result[columns].astype(float))
+        self.encoders['polynomial'] = poly
+        for i, name in enumerate(poly.get_feature_names_out(columns)):
+            if name not in columns:
+                self._register_feature(result, 'poly_' + name.replace(' ', '_x_'), values[:, i],
+                                       f'Polynomial term (degree<={degree}): {name}')
+        return result
+
     def select_features_univariate(
         self,
         X: pd.DataFrame,

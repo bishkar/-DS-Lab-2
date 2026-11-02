@@ -24,12 +24,66 @@ from sklearn.feature_selection import SelectKBest, f_classif, mutual_info_classi
 from sklearn.decomposition import PCA
 from sklearn.utils import resample
 from scipy import stats
-from typing import Tuple, Dict, List, Optional, Any
+from typing import Tuple, Dict, List, Optional, Any, Literal, Union
+from functools import partial
+from itertools import combinations
 from datetime import datetime, timedelta
 import warnings
 import json
 
+from pydantic import NonNegativeInt
+
+from common import (DEFAULT_K, SCALERS, OutlierMethod, Schema, clip_to_bounds, count_duplicates,
+                    dtype_map, fill_mode, memory_mb, missing_summary, outlier_bounds, outside,
+                    safe_divide, validated)
+
 warnings.filterwarnings('ignore')
+
+
+MissingStrategy = Literal['auto', 'simple', 'knn', 'iterative']
+OutlierAction = Literal['cap', 'remove']
+EncodingMethod = Literal['auto', 'onehot', 'label']
+ScalingMethod = Literal['standard', 'robust']
+FeatureKind = Literal['numeric', 'categorical', 'datetime']
+
+_median_imputer = partial(SimpleImputer, strategy='median', keep_empty_features=True)
+NUMERIC_IMPUTERS = {
+    'auto': _median_imputer,
+    'simple': _median_imputer,
+    'knn': partial(KNNImputer, n_neighbors=5, keep_empty_features=True),
+    'iterative': partial(IterativeImputer, max_iter=10, random_state=42, keep_empty_features=True),
+}
+DATETIME_PARTS = {'year': 'year', 'month': 'month', 'day': 'day', 'dayofweek': 'day_of_week'}
+ROW_STATISTICS = ('mean', 'std', 'min', 'max')
+
+
+class MissingValues(Schema):
+    total: NonNegativeInt
+    by_column: Dict[str, NonNegativeInt]
+    percentage_by_column: Dict[str, float]
+
+
+class QualityReport(Schema):
+    shape: Tuple[NonNegativeInt, NonNegativeInt]
+    total_samples: NonNegativeInt
+    total_features: NonNegativeInt
+    memory_usage_mb: float
+    duplicates: NonNegativeInt
+    missing_values: MissingValues
+    data_types: Dict[str, str]
+    numeric_features: List[str]
+    categorical_features: List[str]
+    datetime_features: List[str]
+    target_distribution: Dict[Union[int, float, str], NonNegativeInt]
+    class_balance: float
+
+
+def feature_kind(series: pd.Series) -> FeatureKind:
+    if pd.api.types.is_datetime64_any_dtype(series):
+        return 'datetime'
+    if pd.api.types.is_numeric_dtype(series) and not pd.api.types.is_bool_dtype(series):
+        return 'numeric'
+    return 'categorical'
 
 
 class DataPreprocessor:
@@ -52,7 +106,9 @@ class DataPreprocessor:
         self.preprocessed_data = None
         self.quality_report = {}
         self.preprocessing_steps = []
-        
+        self.encoders = {}
+        self.scaler = None
+
     def assess_data_quality(self) -> Dict[str, Any]:
         """
         Perform comprehensive data quality assessment.
@@ -60,29 +116,57 @@ class DataPreprocessor:
         Returns:
             Dict: Quality assessment report
         """
-        report = {
-            'shape': self.data.shape,
-            'total_samples': len(self.data),
-            'total_features': len(self.data.columns),
-            'memory_usage_mb': self.data.memory_usage(deep=True).sum() / 1024**2,
-            'duplicates': self.data.duplicated().sum(),
-            'missing_values': {},
-            'data_types': {},
-            'numeric_features': [],
-            'categorical_features': [],
-            'datetime_features': [],
-            'target_distribution': {}
-        }
-        
-        # Missing values analysis
-        pass
-        
-        # Data types
-        pass
-        
-        # Target distribution
-        pass
-    
+
+        missing = missing_summary(self.data)
+        kinds = {col: feature_kind(self.data[col]) for col in self.data.columns}
+        counts = (self.data[self.target_col].value_counts()
+                  if self.target_col in self.data.columns else pd.Series(dtype=int))
+
+        def of_kind(kind: FeatureKind) -> List[str]:
+            return [col for col, k in kinds.items() if k == kind]
+
+        self.quality_report = QualityReport(
+            shape=self.data.shape,
+            total_samples=len(self.data),
+            total_features=len(self.data.columns),
+            memory_usage_mb=memory_mb(self.data),
+            duplicates=count_duplicates(self.data),
+            missing_values=MissingValues(
+                total=missing.total,
+                by_column=missing.nonzero_counts,
+                percentage_by_column=missing.nonzero_percentages,
+            ),
+            data_types=dtype_map(self.data),
+            numeric_features=of_kind('numeric'),
+            categorical_features=[col for col in of_kind('categorical') if col != self.target_col],
+            datetime_features=of_kind('datetime'),
+            target_distribution={(key.item() if hasattr(key, 'item') else key): int(n)
+                                 for key, n in counts.items()},
+            class_balance=float(counts.min() / counts.max()) if len(counts) else 0.0,
+        ).model_dump()
+        return self.quality_report
+
+    def print_quality_summary(self):
+        self._ensure_quality_report()
+        self.print_quality_report()
+
+    def _ensure_quality_report(self):
+        if not self.quality_report:
+            self.assess_data_quality()
+
+    def _report_columns(self, key: str) -> List[str]:
+        self._ensure_quality_report()
+        return [col for col in self.quality_report[key]
+                if col != self.target_col and col in self.data.columns]
+
+    def _columns_of_kind(self, data: pd.DataFrame, kind: FeatureKind) -> List[str]:
+        return [col for col in data.columns if col != self.target_col and feature_kind(data[col]) == kind]
+
+    def _commit(self, data: pd.DataFrame, step: str) -> pd.DataFrame:
+        self.data = data
+        self.preprocessing_steps.append(step)
+        return data
+
     def print_quality_report(self):
         """
         Print formatted data quality report.
@@ -122,7 +206,8 @@ class DataPreprocessor:
             print(f"  Class Balance Ratio: {self.quality_report['class_balance']:.3f}")
         print()
     
-    def handle_missing_values(self, strategy: str = 'auto') -> pd.DataFrame:
+    @validated
+    def handle_missing_values(self, strategy: MissingStrategy = 'auto')-> pd.DataFrame:
         """
         Handle missing values with specified strategy.
         
@@ -132,32 +217,17 @@ class DataPreprocessor:
         Returns:
             pd.DataFrame: Data with missing values handled
         """
+
         data = self.data.copy()
-        
-        numeric_cols = [col for col in self.quality_report['numeric_features'] 
-                       if col != self.target_col]
-        categorical_cols = self.quality_report['categorical_features']
-        
-        if strategy == 'auto' or strategy == 'simple':
-            # Numeric: median imputation
-            pass
-            
-            # Categorical: mode imputation
-            if categorical_cols:
-                pass
-        
-        elif strategy == 'knn':
-            pass
-        
-        elif strategy == 'iterative':
-            pass
-        
-        self.data = data
-        self.preprocessing_steps.append(f"Missing values handled: {strategy}")
-        return data
-    
-    def detect_and_handle_outliers(self, method: str = 'iqr', 
-                                   action: str = 'cap') -> pd.DataFrame:
+        numeric_cols = self._report_columns('numeric_features')
+        if numeric_cols:
+            data[numeric_cols] = NUMERIC_IMPUTERS[strategy]().fit_transform(data[numeric_cols])
+        fill_mode(data, self._report_columns('categorical_features'))
+        return self._commit(data, f"Missing values handled: {strategy}")
+
+    @validated
+    def detect_and_handle_outliers(self, method: OutlierMethod = 'iqr',
+                                   action: OutlierAction = 'cap')-> pd.DataFrame:
         """
         Detect and handle outliers.
         
@@ -168,17 +238,23 @@ class DataPreprocessor:
         Returns:
             pd.DataFrame: Data with outliers handled
         """
+
         data = self.data.copy()
-                                       
-        pass
-        
-        self.data = data
-        self.preprocessing_steps.append(
-            f"Outliers handled: {method} method, {action} action, {outliers_count} outliers"
+        bounds = {col: outlier_bounds(data[col], method, DEFAULT_K[method])
+                  for col in self._columns_of_kind(data, 'numeric')}
+        masks = pd.DataFrame({col: outside(data[col], b) for col, b in bounds.items()},
+                             index=data.index, dtype=bool)
+        if action == 'cap':
+            for col, b in bounds.items():
+                data[col] = clip_to_bounds(data[col], b)
+        else:
+            data = data.loc[~masks.any(axis=1)].reset_index(drop=True)
+        return self._commit(
+            data, f"Outliers handled: {method} method, {action} action, {int(masks.values.sum())} outliers"
         )
-        return data
-    
-    def encode_categorical_features(self, method: str = 'auto') -> pd.DataFrame:
+
+    @validated
+    def encode_categorical_features(self, method: EncodingMethod = 'auto')-> pd.DataFrame:
         """
         Encode categorical features.
         
@@ -188,14 +264,25 @@ class DataPreprocessor:
         Returns:
             pd.DataFrame: Data with encoded categorical features
         """
+
         data = self.data.copy()
-        
-        pass
-        
-        self.data = data
-        self.preprocessing_steps.append(f"Categorical encoding: {method}, datetime features extracted")
-        return data
-    
+        for col in self._columns_of_kind(data, 'datetime'):
+            dates = pd.to_datetime(data[col]).dt
+            for name, attribute in DATETIME_PARTS.items():
+                data[f'{col}_{name}'] = getattr(dates, attribute)
+            data = data.drop(columns=[col])
+
+        for col in self._columns_of_kind(data, 'categorical'):
+            if method == 'onehot' or (method == 'auto' and data[col].nunique() <= 10):
+                dummies = pd.get_dummies(data[col], prefix=col, dtype=int)
+                self.encoders[col] = list(dummies.columns)
+                data = pd.concat([data.drop(columns=[col]), dummies], axis=1)
+            else:
+                self.encoders[col] = LabelEncoder()
+                data[col] = self.encoders[col].fit_transform(data[col].astype(str))
+        return self._commit(data, f"Categorical encoding: {method}, datetime features extracted")
+
+    @validated
     def engineer_features(self, domain_features: bool = True) -> pd.DataFrame:
         """
         Engineer new features.
@@ -206,31 +293,23 @@ class DataPreprocessor:
         Returns:
             pd.DataFrame: Data with engineered features
         """
+
         data = self.data.copy()
-        numeric_cols = [col for col in self.quality_report['numeric_features'] 
-                       if col != self.target_col]
-        
+        numeric_cols = self._report_columns('numeric_features')
         new_features = []
-        
-        # Statistical features
         if len(numeric_cols) >= 2:
-            # Mean of all numeric features
-            pass
-            
-            # Standard deviation
-            pass
-            
-            # Min and max
-            pass
-        
-        # Interaction features (limited to avoid explosion)
-        pass
-        
-        self.data = data
-        self.preprocessing_steps.append(f"Feature engineering: {len(new_features)} new features created")
-        return data
-    
-    def scale_features(self, method: str = 'standard') -> pd.DataFrame:
+            for stat in ROW_STATISTICS:
+                data[f'{stat}_all_features'] = getattr(data[numeric_cols], stat)(axis=1)
+                new_features.append(f'{stat}_all_features')
+        if domain_features:
+            for a, b in combinations(numeric_cols[:3], 2):
+                data[f'{a}_x_{b}'] = data[a] * data[b]
+                data[f'{a}_div_{b}'] = safe_divide(data[a], data[b])
+                new_features += [f'{a}_x_{b}', f'{a}_div_{b}']
+        return self._commit(data, f"Feature engineering: {len(new_features)} new features created")
+
+    @validated
+    def scale_features(self, method: ScalingMethod = 'standard')-> pd.DataFrame:
         """
         Scale numerical features.
         
@@ -240,14 +319,14 @@ class DataPreprocessor:
         Returns:
             pd.DataFrame: Data with scaled features
         """
+
         data = self.data.copy()
-        
-        pass
-        
-        self.data = data
-        self.preprocessing_steps.append(f"Feature scaling: {method}")
-        return data
-    
+        numeric_cols = self._columns_of_kind(data, 'numeric')
+        if numeric_cols and len(data) > 0:
+            self.scaler = SCALERS[method]()
+            data[numeric_cols] = self.scaler.fit_transform(data[numeric_cols].astype(float))
+        return self._commit(data, f"Feature scaling: {method}")
+
     def select_features(self, method: str = 'kbest', n_features: int = 20) -> pd.DataFrame:
         """
         Select most important features.
